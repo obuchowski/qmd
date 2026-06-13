@@ -65,17 +65,41 @@ export class HybridLLM implements LLM {
   }
 
   async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
-    // When remote is a RemoteLLM without a rerank model configured, fall back to local rerank
-    // (same fallback shape as expandQuery → local).
-    if (this.remote instanceof RemoteLLM && !this.remote.supportsRerank) {
-      return this.local.rerank(query, documents, options);
+    // Remote configured: never silently fall back to a local GGUF reranker — it
+    // would pull a multi-GB model onto remote-only hosts (same failure mode as
+    // expandQuery). Without a remote rerank model, or on remote error, degrade
+    // to an identity rerank that keeps candidates in their incoming order.
+    if (this.remote instanceof RemoteLLM) {
+      if (!this.remote.supportsRerank) {
+        return this.identityRerank(documents);
+      }
+      try {
+        return await this.remote.rerank(query, documents, options);
+      } catch (error) {
+        console.error("Remote rerank failed; keeping candidate order (no local fallback):", error);
+        return this.identityRerank(documents);
+      }
     }
-    try {
-      return await this.remote.rerank(query, documents, options);
-    } catch (error) {
-      console.error("Remote rerank failed; falling back to local rerank:", error);
-      return this.local.rerank(query, documents, options);
-    }
+    return this.local.rerank(query, documents, options);
+  }
+
+  /**
+   * Identity rerank: preserve the incoming candidate order without scoring via
+   * any model. Scores descend within [0.5, 1.0] so ordering is stable and no
+   * candidate is dropped by a downstream min-score filter. Used when remote
+   * reranking is configured-but-modelless or errors, so we never auto-download
+   * a local GGUF reranker.
+   */
+  private identityRerank(documents: RerankDocument[]): RerankResult {
+    const span = Math.max(1, documents.length - 1);
+    return {
+      model: "none",
+      results: documents.map((d, i) => ({
+        file: d.file,
+        score: 1 - 0.5 * (i / span),
+        index: i,
+      })),
+    };
   }
 
   // Route to local
