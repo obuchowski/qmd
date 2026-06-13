@@ -3922,6 +3922,27 @@ export async function rerank(query: string, documents: { file: string; text: str
 // Reciprocal Rank Fusion
 // =============================================================================
 
+const QMD_SESSION_RANK_WEIGHT: number = (() => {
+  const raw = process.env.QMD_SESSION_RANK_WEIGHT;
+  const n = raw === undefined || raw === "" ? NaN : Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0.7;
+})();
+
+/**
+ * Per-source rank weight applied inside RRF. Session transcripts are noisier
+ * than curated memory/vault notes — a conversation *about* a fact lexically
+ * outranks the one-line fact itself — so their fused contribution is scaled by
+ * QMD_SESSION_RANK_WEIGHT (default 0.7; set 1.0 to disable). The collection is
+ * read from the qmd:// virtual path the search backends place in `file`
+ * (e.g. qmd://sessions-ula/...). Only the memory:session ratio affects
+ * ordering, so this is a gentle tilt — a strongly-relevant session can still
+ * win, it just no longer beats a real note on lexical echo alone.
+ */
+function sourceRankWeight(file: string): number {
+  const collection = file.split("//")[1]?.split("/")[0] ?? "";
+  return collection.startsWith("sessions") ? QMD_SESSION_RANK_WEIGHT : 1.0;
+}
+
 export function reciprocalRankFusion(
   resultLists: RankedResult[][],
   weights: number[] = [],
@@ -3937,7 +3958,7 @@ export function reciprocalRankFusion(
     for (let rank = 0; rank < list.length; rank++) {
       const result = list[rank];
       if (!result) continue;
-      const rrfContribution = weight / (k + rank + 1);
+      const rrfContribution = (weight * sourceRankWeight(result.file)) / (k + rank + 1);
       const existing = scores.get(result.file);
 
       if (existing) {
@@ -3953,12 +3974,14 @@ export function reciprocalRankFusion(
     }
   }
 
-  // Top-rank bonus
+  // Top-rank bonus — also scaled by source weight so the session down-weight
+  // isn't undone by the additive rank-0 bonus.
   for (const entry of scores.values()) {
+    const sw = sourceRankWeight(entry.result.file);
     if (entry.topRank === 0) {
-      entry.rrfScore += 0.05;
+      entry.rrfScore += 0.05 * sw;
     } else if (entry.topRank <= 2) {
-      entry.rrfScore += 0.02;
+      entry.rrfScore += 0.02 * sw;
     }
   }
 
