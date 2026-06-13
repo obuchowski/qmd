@@ -92,9 +92,13 @@ export class HybridLLM implements LLM {
   }
 
   async expandQuery(query: string, options?: LLMExpandQueryOptions): Promise<Queryable[]> {
-    // Route to remote when configured for it; otherwise local (same fallback
-    // shape as rerank → local when remote doesn't support rerank).
-    if (this.remote instanceof RemoteLLM && this.remote.supportsExpand) {
+    // Route to remote whenever a remote LLM is configured — even without a
+    // dedicated expand model. RemoteLLM degrades to a deterministic raw-query
+    // passthrough (lex/vec/hyde = the query itself) when no expand model is set
+    // or the expand call fails, so we never silently pull a multi-GB local GGUF
+    // onto remote-only hosts. Local expansion is used only when there is no
+    // remote LLM configured at all.
+    if (this.remote instanceof RemoteLLM) {
       try {
         return await this.remote.expandQuery(query, options);
       } catch (error) {

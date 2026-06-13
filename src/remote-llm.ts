@@ -502,7 +502,9 @@ export class RemoteLLM implements LLM {
       ],
       temperature: 0.7,
       top_p: 0.8,
-      max_tokens: 600,
+      // Reasoning models (e.g. gpt-oss) spend tokens on hidden reasoning
+      // before emitting content; 600 sometimes left content empty.
+      max_tokens: 2048,
     });
 
     let content = "";
@@ -522,9 +524,12 @@ export class RemoteLLM implements LLM {
       content = json.choices?.[0]?.message?.content ?? "";
     } catch (err) {
       this.expandBreaker.onFailure();
-      // Network error, timeout, or non-2xx. Let HybridLLM fall back to local
-      // query expansion when available; bare RemoteLLM callers see the failure.
-      throw err;
+      // Network error, timeout, or non-2xx. Degrade to the raw-query triple
+      // instead of throwing: falling back to LocalLLM would pull a multi-GB
+      // GGUF onto hosts that are configured remote-only.
+      console.error("Remote query expansion request failed; using raw query:", err);
+      options?.onModelUsed?.(this.expandModelName);
+      return defaultFallback();
     }
 
     // Parse — mirror LocalLLM's parsing exactly so downstream sees consistent
@@ -566,7 +571,11 @@ export class RemoteLLM implements LLM {
     }
 
     this.expandBreaker.onFailure();
-    throw new Error("Expand API returned no parseable query expansions");
+    // Unparseable output (e.g. reasoning model returned empty content).
+    // Same rationale as above: degrade gracefully, never force local models.
+    console.error("Expand API returned no parseable query expansions; using raw query");
+    options?.onModelUsed?.(this.expandModelName);
+    return defaultFallback();
   }
 
   async dispose(): Promise<void> {
