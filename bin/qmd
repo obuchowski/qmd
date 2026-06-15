@@ -9,7 +9,7 @@
 // cmd/ps1/sh shims that invoke `node` directly on every platform.
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,6 +19,28 @@ const self = realpathSync(fileURLToPath(import.meta.url));
 const pkgDir = resolve(dirname(self), "..");
 const jsEntry = resolve(pkgDir, "dist/cli/qmd.js");
 const tsEntry = resolve(pkgDir, "src/cli/qmd.ts");
+
+// --- Embeddings credential: ride the live ChatGPT-subscription (codex) token ---
+// QMD's cloud embeddings authenticate with the OpenAI token that codex stores in
+// ~/.codex/auth.json. Read it here, on every (short-lived, per-op) qmd spawn,
+// rather than from a frozen process-env snapshot — so a rotated token takes
+// effect immediately, with no gateway/service restart. The spawned CLI child
+// inherits these via process.env. Setup-specific to this fork; a safe no-op if
+// the file is absent or unreadable (falls back to any ambient QMD_EMBED_* env).
+try {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  const authPath = home && resolve(home, ".codex/auth.json");
+  if (authPath && existsSync(authPath)) {
+    const token = JSON.parse(readFileSync(authPath, "utf8"))?.tokens?.access_token;
+    if (typeof token === "string" && token.length > 0) {
+      process.env.QMD_EMBED_API_URL = process.env.QMD_EMBED_API_URL || "https://api.openai.com/v1";
+      process.env.QMD_EMBED_API_MODEL = process.env.QMD_EMBED_API_MODEL || "text-embedding-3-large";
+      process.env.QMD_EMBED_API_KEY = token; // always use the live token
+    }
+  }
+} catch {
+  // malformed/unreadable auth.json -> leave ambient env untouched
+}
 
 // MCP stdio reserves stdout exclusively for JSON-RPC frames. node-llama-cpp
 // / llama.cpp / ggml can write native logs directly to stdout before JS-level
