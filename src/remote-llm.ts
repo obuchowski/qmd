@@ -59,9 +59,12 @@ export type RemoteLLMConfig = {
   expandReadTimeoutMs?: number;
   /** Max texts per embed HTTP request (default: 32) */
   maxBatchSize?: number;
+  /** Optional ChatGPT Codex Responses slash-mode directive for non-vector LLM calls. */
+  codexResponsesMode?: RemoteLLMCodexResponsesMode;
 };
 
 export type RemoteLLMApiFormat = "openai-compatible" | "codex-responses";
+export type RemoteLLMCodexResponsesMode = "fast";
 
 // =============================================================================
 // Circuit Breaker
@@ -122,6 +125,7 @@ class CircuitBreaker {
 
 /** Floor for halve-truncating a single oversized document during rerank recovery. */
 const RERANK_MIN_DOC_CHARS = 32;
+const CODEX_RESPONSES_FAST_MODE_DIRECTIVE = "/fast mode";
 
 function isCodexResponsesUrl(url: string | undefined): boolean {
   if (!url) return false;
@@ -143,8 +147,12 @@ function resolveRemoteApiFormat(
   return explicit ?? (isCodexResponsesUrl(url) ? "codex-responses" : "openai-compatible");
 }
 
-function buildCodexResponsesInput(text: string) {
-  return [{ role: "user", content: [{ type: "input_text", text }] }];
+function buildCodexResponsesInput(text: string, mode?: RemoteLLMCodexResponsesMode) {
+  const promptText =
+    mode === "fast" && !text.trimStart().startsWith(CODEX_RESPONSES_FAST_MODE_DIRECTIVE)
+      ? `${CODEX_RESPONSES_FAST_MODE_DIRECTIVE}\n\n${text}`
+      : text;
+  return [{ role: "user", content: [{ type: "input_text", text: promptText }] }];
 }
 
 function extractTextFromResponsesObject(value: unknown): string {
@@ -243,6 +251,18 @@ function parseRemoteApiFormat(
   throw new Error(
     `Invalid ${name}: ${value}. Expected "openai-compatible" or "codex-responses".`
   );
+}
+
+function parseCodexResponsesMode(
+  name: string,
+  value: string | undefined,
+): RemoteLLMCodexResponsesMode | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized || normalized === "default" || normalized === "off" || normalized === "none") {
+    return undefined;
+  }
+  if (normalized === "fast") return "fast";
+  throw new Error(`Invalid ${name}: ${value}. Expected "fast", "default", "off", or "none".`);
 }
 
 function normalizeRerankResults(results: RerankDocumentResult[]): RerankDocumentResult[] {
@@ -588,7 +608,7 @@ export class RemoteLLM implements LLM {
         headers,
         body: JSON.stringify({
           model: rerankModel,
-          input: buildCodexResponsesInput(userPrompt),
+          input: buildCodexResponsesInput(userPrompt, this.config.codexResponsesMode),
           instructions: systemPrompt,
           stream: true,
           store: false,
@@ -714,7 +734,7 @@ export class RemoteLLM implements LLM {
     const body = JSON.stringify(expandFormat === "codex-responses"
       ? {
           model: expandModel,
-          input: buildCodexResponsesInput(userPrompt),
+          input: buildCodexResponsesInput(userPrompt, this.config.codexResponsesMode),
           instructions: systemPrompt,
           stream: true,
           store: false,
@@ -859,6 +879,7 @@ export function remoteConfigFromEnv(yamlModels?: {
   expand_api_model?: string;
   expand_api_format?: string;
   expand_api_key?: string;
+  codex_responses_mode?: string;
 }): RemoteLLMConfig | null {
   const embedApiUrl = process.env.QMD_EMBED_API_URL || yamlModels?.embed_api_url;
   const embedApiModel = process.env.QMD_EMBED_API_MODEL || yamlModels?.embed_api_model;
@@ -896,6 +917,10 @@ export function remoteConfigFromEnv(yamlModels?: {
       process.env.QMD_EXPAND_API_FORMAT || yamlModels?.expand_api_format,
     ),
     expandApiKey: process.env.QMD_EXPAND_API_KEY || yamlModels?.expand_api_key,
+    codexResponsesMode: parseCodexResponsesMode(
+      "QMD_CODEX_RESPONSES_MODE",
+      process.env.QMD_CODEX_RESPONSES_MODE || yamlModels?.codex_responses_mode,
+    ),
     connectTimeoutMs: parseEnvInt("QMD_REMOTE_CONNECT_TIMEOUT", 5000),
     embedReadTimeoutMs: parseEnvInt("QMD_REMOTE_READ_TIMEOUT", 30000),
     rerankReadTimeoutMs: parseEnvInt("QMD_REMOTE_RERANK_TIMEOUT", 60000),

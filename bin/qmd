@@ -47,6 +47,12 @@ try {
       process.env.QMD_RERANK_API_MODEL = process.env.QMD_RERANK_API_MODEL || "gpt-5.4-mini";
       process.env.QMD_RERANK_API_FORMAT = process.env.QMD_RERANK_API_FORMAT || "codex-responses";
       process.env.QMD_RERANK_API_KEY = token;
+
+      // ChatGPT Codex Responses accepts slash-mode directives in the user input.
+      // This applies only to non-vector LLM calls (query expansion/HyDE and
+      // rerank); embeddings use the OpenAI embeddings endpoint above. Set
+      // QMD_CODEX_RESPONSES_MODE=off to keep the default Codex mode.
+      process.env.QMD_CODEX_RESPONSES_MODE = process.env.QMD_CODEX_RESPONSES_MODE || "fast";
     }
   }
 } catch {

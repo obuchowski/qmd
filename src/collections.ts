@@ -62,6 +62,8 @@ export interface ModelsConfig {
   expand_api_format?: "openai-compatible" | "codex-responses";
   /** Bearer token for remote query expansion API */
   expand_api_key?: string;
+  /** Optional ChatGPT Codex Responses slash mode for query expansion/rerank */
+  codex_responses_mode?: "fast" | "default" | "off" | "none";
 }
 
 /**

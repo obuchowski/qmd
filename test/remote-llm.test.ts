@@ -94,7 +94,7 @@ function codexSseText(text: string): string {
 function withRemoteEnvCleared<T>(fn: () => T): T {
   const saved: Record<string, string | undefined> = {};
   for (const key of Object.keys(process.env)) {
-    if (key.startsWith("QMD_") && key.includes("API")) {
+    if ((key.startsWith("QMD_") && key.includes("API")) || key === "QMD_CODEX_RESPONSES_MODE") {
       saved[key] = process.env[key];
       delete process.env[key];
     }
@@ -362,6 +362,7 @@ describe("RemoteLLM", () => {
         expect(parsed.model).toBe("gpt-5.4-mini");
         expect(parsed.stream).toBe(true);
         expect(parsed.instructions).toContain("strict JSON");
+        expect(parsed.input[0].content[0].text).toMatch(/^\/fast mode\n\n/);
         expect(parsed.input[0].content[0].text).toContain("Query:\nsearch docs");
         expect(parsed.input[0].content[0].text).toContain("Document 1");
         return {
@@ -380,6 +381,7 @@ describe("RemoteLLM", () => {
         rerankApiUrl: baseUrl(),
         rerankApiModel: "gpt-5.4-mini",
         rerankApiFormat: "codex-responses",
+        codexResponsesMode: "fast",
       });
       const result = await llm.rerank("search docs", [
         { file: "a.md", text: "doc A text" },
@@ -500,6 +502,7 @@ describe("RemoteLLM", () => {
         expect(parsed.model).toBe("gpt-5.4-mini");
         expect(parsed.stream).toBe(true);
         expect(parsed.instructions).toContain("You expand search queries");
+        expect(parsed.input[0].content[0].text).toMatch(/^\/fast mode\n\n/);
         expect(parsed.input[0].content[0].text).toContain("search docs");
         return {
           status: 200,
@@ -516,6 +519,7 @@ describe("RemoteLLM", () => {
         expandApiUrl: baseUrl(),
         expandApiModel: "gpt-5.4-mini",
         expandApiFormat: "codex-responses",
+        codexResponsesMode: "fast",
       });
       const result = await llm.expandQuery("search docs");
       expect(result).toEqual([
@@ -811,7 +815,7 @@ describe("remoteConfigFromEnv", () => {
   beforeEach(() => {
     // Clear any QMD_ env vars
     for (const key of Object.keys(process.env)) {
-      if (key.startsWith("QMD_") && key.includes("API")) {
+      if ((key.startsWith("QMD_") && key.includes("API")) || key === "QMD_CODEX_RESPONSES_MODE") {
         delete process.env[key];
       }
     }
@@ -820,7 +824,7 @@ describe("remoteConfigFromEnv", () => {
   afterAll(() => {
     // Restore original env
     for (const key of Object.keys(process.env)) {
-      if (key.startsWith("QMD_") && key.includes("API")) {
+      if ((key.startsWith("QMD_") && key.includes("API")) || key === "QMD_CODEX_RESPONSES_MODE") {
         delete process.env[key];
       }
     }
@@ -837,6 +841,7 @@ describe("remoteConfigFromEnv", () => {
     process.env.QMD_EMBED_API_KEY = "secret";
     process.env.QMD_RERANK_API_FORMAT = "codex-responses";
     process.env.QMD_EXPAND_API_FORMAT = "codex-responses";
+    process.env.QMD_CODEX_RESPONSES_MODE = "fast";
 
     const config = remoteConfigFromEnv();
     expect(config).not.toBeNull();
@@ -845,6 +850,7 @@ describe("remoteConfigFromEnv", () => {
     expect(config!.embedApiKey).toBe("secret");
     expect(config!.rerankApiFormat).toBe("codex-responses");
     expect(config!.expandApiFormat).toBe("codex-responses");
+    expect(config!.codexResponsesMode).toBe("fast");
   });
 
   it("should use YAML config as fallback", () => {
