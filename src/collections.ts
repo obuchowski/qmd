@@ -50,12 +50,16 @@ export interface ModelsConfig {
   rerank_api_url?: string;
   /** Remote rerank model name */
   rerank_api_model?: string;
+  /** Remote rerank API protocol */
+  rerank_api_format?: "openai-compatible" | "codex-responses";
   /** Bearer token for remote rerank API */
   rerank_api_key?: string;
   /** Remote query expansion API base URL */
   expand_api_url?: string;
   /** Remote query expansion chat model name */
   expand_api_model?: string;
+  /** Remote query expansion API protocol */
+  expand_api_format?: "openai-compatible" | "codex-responses";
   /** Bearer token for remote query expansion API */
   expand_api_key?: string;
 }

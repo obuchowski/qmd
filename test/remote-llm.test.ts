@@ -16,7 +16,13 @@ import type { LLM, EmbeddingResult, RerankResult, Queryable, GenerateResult, Mod
 // Mock HTTP server
 // =============================================================================
 
-type MockHandler = (req: IncomingMessage, body: string) => { status: number; body: any };
+type MockResponse = {
+  status: number;
+  body: any;
+  headers?: Record<string, string>;
+  raw?: boolean;
+};
+type MockHandler = (req: IncomingMessage, body: string) => MockResponse;
 
 let server: Server;
 let serverPort: number;
@@ -36,8 +42,11 @@ beforeAll(async () => {
 
     try {
       const result = mockHandler(req, body);
-      res.writeHead(result.status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(result.body));
+      res.writeHead(result.status, {
+        "Content-Type": result.raw ? "text/event-stream" : "application/json",
+        ...result.headers,
+      });
+      res.end(result.raw ? String(result.body) : JSON.stringify(result.body));
     } catch (err: any) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: err.message }));
@@ -69,6 +78,17 @@ function createRemoteLLM(overrides?: Partial<RemoteLLMConfig>): RemoteLLM {
     embedApiModel: "test-model",
     ...overrides,
   });
+}
+
+function codexSseText(text: string): string {
+  return [
+    "event: response.output_text.delta",
+    `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}`,
+    "",
+    "event: response.completed",
+    `data: ${JSON.stringify({ type: "response.completed", response: { output: [] } })}`,
+    "",
+  ].join("\n");
 }
 
 function withRemoteEnvCleared<T>(fn: () => T): T {
@@ -334,6 +354,43 @@ describe("RemoteLLM", () => {
       expect(result.results.find(r => r.file === "b.md")!.score).toBe(0.2);
     });
 
+    it("reranks through Codex Responses SSE when configured", async () => {
+      setMockHandler((req, body) => {
+        expect(req.url).toBe("/v1/responses");
+        expect(req.headers.accept).toBe("text/event-stream");
+        const parsed = JSON.parse(body);
+        expect(parsed.model).toBe("gpt-5.4-mini");
+        expect(parsed.stream).toBe(true);
+        expect(parsed.instructions).toContain("strict JSON");
+        expect(parsed.input[0].content[0].text).toContain("Query:\nsearch docs");
+        expect(parsed.input[0].content[0].text).toContain("Document 1");
+        return {
+          status: 200,
+          raw: true,
+          body: codexSseText(JSON.stringify({
+            results: [
+              { index: 1, relevance_score: 0.91 },
+              { index: 0, relevance_score: 0.2 },
+            ],
+          })),
+        };
+      });
+
+      const llm = createRemoteLLM({
+        rerankApiUrl: baseUrl(),
+        rerankApiModel: "gpt-5.4-mini",
+        rerankApiFormat: "codex-responses",
+      });
+      const result = await llm.rerank("search docs", [
+        { file: "a.md", text: "doc A text" },
+        { file: "b.md", text: "doc B text" },
+      ]);
+
+      expect(result.model).toBe("gpt-5.4-mini");
+      expect(result.results.map(r => r.file)).toEqual(["b.md", "a.md"]);
+      expect(result.results[0].score).toBe(0.91);
+    });
+
     it("recovers from an oversized rerank batch by splitting", async () => {
       // log-odds keyed by document text; the server rejects any multi-document
       // batch as "too large", forcing recursive bisection down to single docs.
@@ -435,6 +492,39 @@ describe("RemoteLLM", () => {
       ]);
     });
 
+    it("expands queries through Codex Responses SSE when configured", async () => {
+      setMockHandler((req, body) => {
+        expect(req.url).toBe("/v1/responses");
+        expect(req.headers.accept).toBe("text/event-stream");
+        const parsed = JSON.parse(body);
+        expect(parsed.model).toBe("gpt-5.4-mini");
+        expect(parsed.stream).toBe(true);
+        expect(parsed.instructions).toContain("You expand search queries");
+        expect(parsed.input[0].content[0].text).toContain("search docs");
+        return {
+          status: 200,
+          raw: true,
+          body: codexSseText([
+            "lex: search docs keywords",
+            "vec: semantic search docs",
+            "hyde: Information about search docs",
+          ].join("\n")),
+        };
+      });
+
+      const llm = createRemoteLLM({
+        expandApiUrl: baseUrl(),
+        expandApiModel: "gpt-5.4-mini",
+        expandApiFormat: "codex-responses",
+      });
+      const result = await llm.expandQuery("search docs");
+      expect(result).toEqual([
+        { type: "lex", text: "search docs keywords" },
+        { type: "vec", text: "semantic search docs" },
+        { type: "hyde", text: "Information about search docs" },
+      ]);
+    });
+
     it("opens an independent circuit breaker after repeated expansion failures", async () => {
       let requestCount = 0;
       setMockHandler(() => {
@@ -447,7 +537,11 @@ describe("RemoteLLM", () => {
 
       const llm = createRemoteLLM({ expandApiModel: "remote-chat" });
       for (let i = 0; i < 3; i++) {
-        await expect(llm.expandQuery("test query")).rejects.toThrow("500");
+        await expect(llm.expandQuery("test query")).resolves.toEqual([
+          { type: "hyde", text: "Information about test query" },
+          { type: "lex", text: "test query" },
+          { type: "vec", text: "test query" },
+        ]);
       }
 
       await expect(llm.expandQuery("test query")).rejects.toThrow("circuit breaker");
@@ -483,7 +577,11 @@ describe("RemoteLLM", () => {
 
       const llm = createRemoteLLM({ expandApiModel: "remote-chat" });
       for (let i = 0; i < 3; i++) {
-        await expect(llm.expandQuery("test query")).rejects.toThrow("no parseable");
+        await expect(llm.expandQuery("test query")).resolves.toEqual([
+          { type: "hyde", text: "Information about test query" },
+          { type: "lex", text: "test query" },
+          { type: "vec", text: "test query" },
+        ]);
       }
 
       await expect(llm.expandQuery("test query")).rejects.toThrow("circuit breaker");
@@ -580,16 +678,20 @@ describe("HybridLLM", () => {
     expect(result!.model).toBe("local-model");
   });
 
-  it("should route expandQuery to local", async () => {
+  it("should use remote raw-query expansion fallback when no remote expand model is set", async () => {
     const local = createMockLocalLLM();
     const remote = createRemoteLLM();
     const hybrid = new HybridLLM(remote, local);
 
     const result = await hybrid.expandQuery("test query");
-    expect(result[0]!.text).toBe("expanded query");
+    expect(result).toEqual([
+      { type: "hyde", text: "Information about test query" },
+      { type: "lex", text: "test query" },
+      { type: "vec", text: "test query" },
+    ]);
   });
 
-  it("falls back to local rerank when configured remote rerank fails", async () => {
+  it("keeps candidate order when configured remote rerank fails", async () => {
     setMockHandler(() => ({
       status: 500,
       body: { error: "rerank down" },
@@ -600,11 +702,11 @@ describe("HybridLLM", () => {
     const hybrid = new HybridLLM(remote, local);
 
     const result = await hybrid.rerank("query", [{ file: "doc.md", text: "doc text" }]);
-    expect(result.model).toBe("local-rerank-model");
-    expect(result.results).toEqual([{ file: "doc.md", score: 0.42, index: 0 }]);
+    expect(result.model).toBe("none");
+    expect(result.results).toEqual([{ file: "doc.md", score: 1, index: 0 }]);
   });
 
-  it("falls back to local expansion when configured remote expansion fails", async () => {
+  it("uses remote raw-query expansion fallback when configured remote expansion fails", async () => {
     setMockHandler(() => ({
       status: 500,
       body: { error: "chat down" },
@@ -615,10 +717,14 @@ describe("HybridLLM", () => {
     const hybrid = new HybridLLM(remote, local);
 
     const result = await hybrid.expandQuery("test query");
-    expect(result).toEqual([{ type: "lex", text: "expanded query" }]);
+    expect(result).toEqual([
+      { type: "hyde", text: "Information about test query" },
+      { type: "lex", text: "test query" },
+      { type: "vec", text: "test query" },
+    ]);
   });
 
-  it("falls back to local expansion when configured remote expansion is unparseable", async () => {
+  it("uses remote raw-query expansion fallback when configured remote expansion is unparseable", async () => {
     setMockHandler(() => ({
       status: 200,
       body: {
@@ -635,7 +741,11 @@ describe("HybridLLM", () => {
     const hybrid = new HybridLLM(remote, local);
 
     const result = await hybrid.expandQuery("test query");
-    expect(result).toEqual([{ type: "lex", text: "expanded query" }]);
+    expect(result).toEqual([
+      { type: "hyde", text: "Information about test query" },
+      { type: "lex", text: "test query" },
+      { type: "vec", text: "test query" },
+    ]);
   });
 
   it("should use remote embedModelName", async () => {
@@ -725,12 +835,16 @@ describe("remoteConfigFromEnv", () => {
     process.env.QMD_EMBED_API_URL = "http://gpu:8000/v1";
     process.env.QMD_EMBED_API_MODEL = "bge-m3";
     process.env.QMD_EMBED_API_KEY = "secret";
+    process.env.QMD_RERANK_API_FORMAT = "codex-responses";
+    process.env.QMD_EXPAND_API_FORMAT = "codex-responses";
 
     const config = remoteConfigFromEnv();
     expect(config).not.toBeNull();
     expect(config!.embedApiUrl).toBe("http://gpu:8000/v1");
     expect(config!.embedApiModel).toBe("bge-m3");
     expect(config!.embedApiKey).toBe("secret");
+    expect(config!.rerankApiFormat).toBe("codex-responses");
+    expect(config!.expandApiFormat).toBe("codex-responses");
   });
 
   it("should use YAML config as fallback", () => {
@@ -764,6 +878,14 @@ describe("remoteConfigFromEnv", () => {
   it("throws on incomplete remote config (model without url)", () => {
     expect(() => remoteConfigFromEnv({ embed_api_model: "bge-m3" }))
       .toThrow(/incomplete remote embedding/i);
+  });
+
+  it("throws on invalid remote API format", () => {
+    process.env.QMD_EMBED_API_URL = "http://gpu:8000/v1";
+    process.env.QMD_EMBED_API_MODEL = "bge-m3";
+    process.env.QMD_EXPAND_API_FORMAT = "chatgpt";
+
+    expect(() => remoteConfigFromEnv()).toThrow(/invalid QMD_EXPAND_API_FORMAT/i);
   });
 });
 

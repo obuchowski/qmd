@@ -37,12 +37,16 @@ export type RemoteLLMConfig = {
   rerankApiUrl?: string;
   /** Model name for reranking */
   rerankApiModel?: string;
+  /** Rerank protocol. Auto-detected for ChatGPT/Codex Responses endpoints when omitted. */
+  rerankApiFormat?: RemoteLLMApiFormat;
   /** Optional bearer token for rerank endpoint */
   rerankApiKey?: string;
-  /** Base URL for query-expansion endpoint (defaults to embedApiUrl). Hits POST <url>/chat/completions. */
+  /** Base URL for query-expansion endpoint (defaults to embedApiUrl). */
   expandApiUrl?: string;
   /** Model name for query expansion (any chat-completion model). */
   expandApiModel?: string;
+  /** Query expansion protocol. Auto-detected for ChatGPT/Codex Responses endpoints when omitted. */
+  expandApiFormat?: RemoteLLMApiFormat;
   /** Optional bearer token for expand endpoint. */
   expandApiKey?: string;
   /** Connect timeout in ms (default: 5000) */
@@ -56,6 +60,8 @@ export type RemoteLLMConfig = {
   /** Max texts per embed HTTP request (default: 32) */
   maxBatchSize?: number;
 };
+
+export type RemoteLLMApiFormat = "openai-compatible" | "codex-responses";
 
 // =============================================================================
 // Circuit Breaker
@@ -116,6 +122,138 @@ class CircuitBreaker {
 
 /** Floor for halve-truncating a single oversized document during rerank recovery. */
 const RERANK_MIN_DOC_CHARS = 32;
+
+function isCodexResponsesUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.hostname.toLowerCase() === "chatgpt.com" &&
+      parsed.pathname.replace(/\/+$/u, "").toLowerCase().includes("/backend-api/codex")
+    );
+  } catch {
+    return /\/backend-api\/codex(?:\/|$)/i.test(url);
+  }
+}
+
+function resolveRemoteApiFormat(
+  explicit: RemoteLLMApiFormat | undefined,
+  url: string | undefined,
+): RemoteLLMApiFormat {
+  return explicit ?? (isCodexResponsesUrl(url) ? "codex-responses" : "openai-compatible");
+}
+
+function buildCodexResponsesInput(text: string) {
+  return [{ role: "user", content: [{ type: "input_text", text }] }];
+}
+
+function extractTextFromResponsesObject(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const record = value as Record<string, unknown>;
+  if (typeof record.output_text === "string") return record.output_text;
+  const output = Array.isArray(record.output) ? record.output : [];
+  const chunks: string[] = [];
+  for (const item of output) {
+    if (!item || typeof item !== "object") continue;
+    const content = (item as Record<string, unknown>).content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      const partRecord = part as Record<string, unknown>;
+      if (
+        (partRecord.type === "output_text" || partRecord.type === "text") &&
+        typeof partRecord.text === "string"
+      ) {
+        chunks.push(partRecord.text);
+      }
+    }
+  }
+  return chunks.join("");
+}
+
+function parseJsonFromModelText(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error("empty model response");
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const fenced = /```(?:json)?\s*([\s\S]*?)\s*```/i.exec(trimmed)?.[1]?.trim();
+    if (fenced) return JSON.parse(fenced);
+    const objectStart = trimmed.indexOf("{");
+    const objectEnd = trimmed.lastIndexOf("}");
+    if (objectStart !== -1 && objectEnd > objectStart) {
+      return JSON.parse(trimmed.slice(objectStart, objectEnd + 1));
+    }
+    const arrayStart = trimmed.indexOf("[");
+    const arrayEnd = trimmed.lastIndexOf("]");
+    if (arrayStart !== -1 && arrayEnd > arrayStart) {
+      return JSON.parse(trimmed.slice(arrayStart, arrayEnd + 1));
+    }
+    throw new Error("model response did not contain JSON");
+  }
+}
+
+async function readCodexResponsesText(response: Response): Promise<string> {
+  const raw = await response.text();
+  let deltaText = "";
+  let completedText = "";
+
+  for (const block of raw.split(/\r?\n\r?\n/u)) {
+    const data = block
+      .split(/\r?\n/u)
+      .filter(line => line.startsWith("data:"))
+      .map(line => line.slice("data:".length).trimStart())
+      .join("\n")
+      .trim();
+
+    if (!data || data === "[DONE]") continue;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      continue;
+    }
+
+    if (!parsed || typeof parsed !== "object") continue;
+    const event = parsed as Record<string, unknown>;
+
+    if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
+      deltaText += event.delta;
+      continue;
+    }
+
+    if (event.type === "response.completed") {
+      const text = extractTextFromResponsesObject(event.response);
+      if (text) completedText = text;
+    }
+  }
+
+  const text = deltaText || completedText;
+  if (text.trim()) return text;
+  throw new Error("Codex Responses API returned no output text");
+}
+
+function parseRemoteApiFormat(
+  name: string,
+  value: string | undefined,
+): RemoteLLMApiFormat | undefined {
+  if (!value) return undefined;
+  if (value === "openai-compatible" || value === "codex-responses") return value;
+  throw new Error(
+    `Invalid ${name}: ${value}. Expected "openai-compatible" or "codex-responses".`
+  );
+}
+
+function normalizeRerankResults(results: RerankDocumentResult[]): RerankDocumentResult[] {
+  const needsSigmoid = results.some(r => r.score < 0 || r.score > 1);
+  const normalized = needsSigmoid
+    ? results.map(r => ({ ...r, score: 1 / (1 + Math.exp(-r.score)) }))
+    : [...results];
+
+  normalized.sort((a, b) => b.score - a.score);
+  return normalized;
+}
 
 /**
  * True when a rerank request failed because the payload exceeded what the
@@ -309,6 +447,11 @@ export class RemoteLLM implements LLM {
       );
     }
 
+    const rerankFormat = resolveRemoteApiFormat(this.config.rerankApiFormat, rerankUrl);
+    if (rerankFormat === "codex-responses") {
+      return this.rerankWithCodexResponses(query, documents, rerankUrl, rerankModel, rerankKey);
+    }
+
     const url = normalizeUrl(rerankUrl, "/rerank");
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (rerankKey) {
@@ -403,16 +546,85 @@ export class RemoteLLM implements LLM {
       // (any score < 0 or > 1). (A logit reranker whose scores for a query all
       // land within [0,1] is left as-is; an explicit per-endpoint normalization
       // config could remove that ambiguity as a follow-up.)
-      const needsSigmoid = merged.some(r => r.score < 0 || r.score > 1);
-      const results = needsSigmoid
-        ? merged.map(r => ({ ...r, score: 1 / (1 + Math.exp(-r.score)) }))
-        : merged;
-
-      // Recovery merges sub-batches out of global rank order; sort for a coherent
-      // final ranking (no-op on the common single-request path).
-      results.sort((a, b) => b.score - a.score);
+      const results = normalizeRerankResults(merged);
       this.rerankBreaker.onSuccess();
       return { results, model: rerankModel };
+    } catch (err) {
+      this.rerankBreaker.onFailure();
+      throw err;
+    }
+  }
+
+  private async rerankWithCodexResponses(
+    query: string,
+    documents: RerankDocument[],
+    rerankUrl: string,
+    rerankModel: string,
+    rerankKey?: string,
+  ): Promise<RerankResult> {
+    const url = normalizeUrl(rerankUrl, "/responses");
+    const headers: Record<string, string> = {
+      "Accept": "text/event-stream",
+      "Content-Type": "application/json",
+    };
+    if (rerankKey) {
+      headers["Authorization"] = `Bearer ${rerankKey}`;
+    }
+
+    const systemPrompt =
+      "You rerank search result chunks for relevance to a user query. " +
+      "Return strict JSON only, with no markdown or explanation. " +
+      "Use this exact shape: {\"results\":[{\"index\":0,\"relevance_score\":0.0}]}. " +
+      "index must refer to the provided document index. relevance_score must be a number from 0 to 1.";
+
+    const docs = documents
+      .map((doc, index) => `Document ${index}\nFile: ${doc.file}\nText:\n${doc.text}`)
+      .join("\n\n---\n\n");
+    const userPrompt = `Query:\n${query}\n\nDocuments:\n${docs}`;
+
+    try {
+      const response = await fetchWithTimeout(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: rerankModel,
+          input: buildCodexResponsesInput(userPrompt),
+          instructions: systemPrompt,
+          stream: true,
+          store: false,
+          reasoning: { effort: "none" },
+        }),
+      }, this.config.rerankReadTimeoutMs);
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        throw new Error(`Rerank API returned ${response.status}: ${errText}`);
+      }
+
+      const json = parseJsonFromModelText(await readCodexResponsesText(response)) as {
+        results?: { index?: unknown; relevance_score?: unknown }[];
+      };
+
+      const merged: RerankDocumentResult[] = [];
+      const seen = new Set<number>();
+      for (const item of json.results ?? []) {
+        if (typeof item.index !== "number" || typeof item.relevance_score !== "number") continue;
+        if (!Number.isInteger(item.index) || item.index < 0 || item.index >= documents.length) continue;
+        if (!Number.isFinite(item.relevance_score) || seen.has(item.index)) continue;
+        seen.add(item.index);
+        merged.push({
+          file: documents[item.index]!.file,
+          score: item.relevance_score,
+          index: item.index,
+        });
+      }
+
+      if (merged.length === 0) {
+        throw new Error("Codex Responses rerank returned no parseable scores");
+      }
+
+      this.rerankBreaker.onSuccess();
+      return { results: normalizeRerankResults(merged), model: rerankModel };
     } catch (err) {
       this.rerankBreaker.onFailure();
       throw err;
@@ -490,22 +702,36 @@ export class RemoteLLM implements LLM {
       ? `Expand this search query: ${query}\nQuery intent: ${intent}`
       : `Expand this search query: ${query}`;
 
-    const url = normalizeUrl(expandUrl, "/chat/completions");
+    const expandFormat = resolveRemoteApiFormat(this.config.expandApiFormat, expandUrl);
+    const url = normalizeUrl(
+      expandUrl,
+      expandFormat === "codex-responses" ? "/responses" : "/chat/completions",
+    );
     const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (expandFormat === "codex-responses") headers["Accept"] = "text/event-stream";
     if (expandKey) headers["Authorization"] = `Bearer ${expandKey}`;
 
-    const body = JSON.stringify({
-      model: expandModel,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      temperature: 0.7,
-      top_p: 0.8,
-      // Reasoning models (e.g. gpt-oss) spend tokens on hidden reasoning
-      // before emitting content; 600 sometimes left content empty.
-      max_tokens: 2048,
-    });
+    const body = JSON.stringify(expandFormat === "codex-responses"
+      ? {
+          model: expandModel,
+          input: buildCodexResponsesInput(userPrompt),
+          instructions: systemPrompt,
+          stream: true,
+          store: false,
+          reasoning: { effort: "none" },
+        }
+      : {
+          model: expandModel,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.7,
+          top_p: 0.8,
+          // Reasoning models (e.g. gpt-oss) spend tokens on hidden reasoning
+          // before emitting content; 600 sometimes left content empty.
+          max_tokens: 2048,
+        });
 
     let content = "";
     try {
@@ -518,10 +744,14 @@ export class RemoteLLM implements LLM {
         const errText = await response.text().catch(() => "");
         throw new Error(`Expand API returned ${response.status}: ${errText}`);
       }
-      const json = (await response.json()) as {
-        choices?: { message?: { content?: string } }[];
-      };
-      content = json.choices?.[0]?.message?.content ?? "";
+      if (expandFormat === "codex-responses") {
+        content = await readCodexResponsesText(response);
+      } else {
+        const json = (await response.json()) as {
+          choices?: { message?: { content?: string } }[];
+        };
+        content = json.choices?.[0]?.message?.content ?? "";
+      }
     } catch (err) {
       this.expandBreaker.onFailure();
       // Network error, timeout, or non-2xx. Degrade to the raw-query triple
@@ -623,9 +853,11 @@ export function remoteConfigFromEnv(yamlModels?: {
   embed_api_key?: string;
   rerank_api_url?: string;
   rerank_api_model?: string;
+  rerank_api_format?: string;
   rerank_api_key?: string;
   expand_api_url?: string;
   expand_api_model?: string;
+  expand_api_format?: string;
   expand_api_key?: string;
 }): RemoteLLMConfig | null {
   const embedApiUrl = process.env.QMD_EMBED_API_URL || yamlModels?.embed_api_url;
@@ -652,9 +884,17 @@ export function remoteConfigFromEnv(yamlModels?: {
     embedApiKey: process.env.QMD_EMBED_API_KEY || yamlModels?.embed_api_key,
     rerankApiUrl: process.env.QMD_RERANK_API_URL || yamlModels?.rerank_api_url,
     rerankApiModel: process.env.QMD_RERANK_API_MODEL || yamlModels?.rerank_api_model,
+    rerankApiFormat: parseRemoteApiFormat(
+      "QMD_RERANK_API_FORMAT",
+      process.env.QMD_RERANK_API_FORMAT || yamlModels?.rerank_api_format,
+    ),
     rerankApiKey: process.env.QMD_RERANK_API_KEY || yamlModels?.rerank_api_key,
     expandApiUrl: process.env.QMD_EXPAND_API_URL || yamlModels?.expand_api_url,
     expandApiModel: process.env.QMD_EXPAND_API_MODEL || yamlModels?.expand_api_model,
+    expandApiFormat: parseRemoteApiFormat(
+      "QMD_EXPAND_API_FORMAT",
+      process.env.QMD_EXPAND_API_FORMAT || yamlModels?.expand_api_format,
+    ),
     expandApiKey: process.env.QMD_EXPAND_API_KEY || yamlModels?.expand_api_key,
     connectTimeoutMs: parseEnvInt("QMD_REMOTE_CONNECT_TIMEOUT", 5000),
     embedReadTimeoutMs: parseEnvInt("QMD_REMOTE_READ_TIMEOUT", 30000),

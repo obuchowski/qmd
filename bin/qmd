@@ -20,13 +20,14 @@ const pkgDir = resolve(dirname(self), "..");
 const jsEntry = resolve(pkgDir, "dist/cli/qmd.js");
 const tsEntry = resolve(pkgDir, "src/cli/qmd.ts");
 
-// --- Embeddings credential: ride the live ChatGPT-subscription (codex) token ---
-// QMD's cloud embeddings authenticate with the OpenAI token that codex stores in
-// ~/.codex/auth.json. Read it here, on every (short-lived, per-op) qmd spawn,
-// rather than from a frozen process-env snapshot — so a rotated token takes
-// effect immediately, with no gateway/service restart. The spawned CLI child
-// inherits these via process.env. Setup-specific to this fork; a safe no-op if
-// the file is absent or unreadable (falls back to any ambient QMD_EMBED_* env).
+// --- Cloud model credentials: ride the live ChatGPT-subscription (codex) token ---
+// QMD's cloud embeddings, query expansion, and LLM reranking authenticate with
+// the OpenAI token that codex stores in ~/.codex/auth.json. Read it here, on
+// every (short-lived, per-op) qmd spawn, rather than from a frozen process-env
+// snapshot — so a rotated token takes effect immediately, with no gateway/service
+// restart. The spawned CLI child inherits these via process.env. Setup-specific
+// to this fork; a safe no-op if the file is absent or unreadable (falls back to
+// any ambient QMD_* env).
 try {
   const home = process.env.HOME || process.env.USERPROFILE || "";
   const authPath = home && resolve(home, ".codex/auth.json");
@@ -36,6 +37,16 @@ try {
       process.env.QMD_EMBED_API_URL = process.env.QMD_EMBED_API_URL || "https://api.openai.com/v1";
       process.env.QMD_EMBED_API_MODEL = process.env.QMD_EMBED_API_MODEL || "text-embedding-3-large";
       process.env.QMD_EMBED_API_KEY = token; // always use the live token
+
+      process.env.QMD_EXPAND_API_URL = process.env.QMD_EXPAND_API_URL || "https://chatgpt.com/backend-api/codex";
+      process.env.QMD_EXPAND_API_MODEL = process.env.QMD_EXPAND_API_MODEL || "gpt-5.4-mini";
+      process.env.QMD_EXPAND_API_FORMAT = process.env.QMD_EXPAND_API_FORMAT || "codex-responses";
+      process.env.QMD_EXPAND_API_KEY = token;
+
+      process.env.QMD_RERANK_API_URL = process.env.QMD_RERANK_API_URL || "https://chatgpt.com/backend-api/codex";
+      process.env.QMD_RERANK_API_MODEL = process.env.QMD_RERANK_API_MODEL || "gpt-5.4-mini";
+      process.env.QMD_RERANK_API_FORMAT = process.env.QMD_RERANK_API_FORMAT || "codex-responses";
+      process.env.QMD_RERANK_API_KEY = token;
     }
   }
 } catch {
