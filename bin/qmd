@@ -32,7 +32,11 @@ try {
   const home = process.env.HOME || process.env.USERPROFILE || "";
   const authPath = home && resolve(home, ".codex/auth.json");
   if (authPath && existsSync(authPath)) {
-    const token = JSON.parse(readFileSync(authPath, "utf8"))?.tokens?.access_token;
+    const auth = JSON.parse(readFileSync(authPath, "utf8"));
+    // Subscription (OAuth) mode stores a rotating token under tokens.access_token;
+    // API-key mode stores a static OPENAI_API_KEY. Prefer the live OAuth token,
+    // fall back to the API key so memory search keeps working in either mode.
+    const token = auth?.tokens?.access_token || auth?.OPENAI_API_KEY;
     if (typeof token === "string" && token.length > 0) {
       process.env.QMD_EMBED_API_URL = process.env.QMD_EMBED_API_URL || "https://api.openai.com/v1";
       process.env.QMD_EMBED_API_MODEL = process.env.QMD_EMBED_API_MODEL || "text-embedding-3-large";
