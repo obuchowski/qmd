@@ -20,43 +20,74 @@ const pkgDir = resolve(dirname(self), "..");
 const jsEntry = resolve(pkgDir, "dist/cli/qmd.js");
 const tsEntry = resolve(pkgDir, "src/cli/qmd.ts");
 
-// --- Cloud model credentials: ride the live ChatGPT-subscription (codex) token ---
+// --- Cloud model credentials: auth-mode-aware resolver over ~/.codex/auth.json ---
 // QMD's cloud embeddings, query expansion, and LLM reranking authenticate with
-// the OpenAI token that codex stores in ~/.codex/auth.json. Read it here, on
+// whatever OpenAI credential codex stores in ~/.codex/auth.json. Read it here, on
 // every (short-lived, per-op) qmd spawn, rather than from a frozen process-env
-// snapshot — so a rotated token takes effect immediately, with no gateway/service
-// restart. The spawned CLI child inherits these via process.env. Setup-specific
-// to this fork; a safe no-op if the file is absent or unreadable (falls back to
-// any ambient QMD_* env).
+// snapshot — so a rotated token / mode switch takes effect immediately, with no
+// gateway/service restart. The spawned CLI child inherits these via process.env.
+//
+// Two auth modes, and the LLM endpoints differ between them:
+//   * ChatGPT subscription (OAuth) -> auth.json has tokens.access_token. Chat-style
+//     generation (query expansion/HyDE + rerank) is only reachable through the Codex
+//     Responses endpoint (chatgpt.com/backend-api/codex); the plain OpenAI API 401s
+//     for a sub token on those routes.
+//   * API key -> auth.json has OPENAI_API_KEY, no tokens. The Codex endpoint 401s for
+//     an API key, so LLM ops must go to the standard OpenAI Chat Completions API.
+// Embeddings (/v1/embeddings on api.openai.com) accept BOTH credential kinds, so that
+// endpoint is mode-independent.
+//
+// The "smart URL resolver" only needs to pick the LLM base URL by mode: QMD itself
+// derives the wire format from the URL (codex-responses for chatgpt.com/backend-api/
+// codex, openai-compatible -> /chat/completions otherwise, see resolveRemoteApiFormat
+// in src/remote-llm.ts). So we set the URL to match the auth mode and let QMD resolve
+// the format — flip the auth mode (or later point expand/rerank back at the sub) and
+// the next spawn re-resolves with no 401s and no wrapper change. We intentionally do
+// NOT pin QMD_*_API_FORMAT, so the format always follows the effective URL.
+// Setup-specific to this fork; a safe no-op if the file is absent/unreadable.
 try {
   const home = process.env.HOME || process.env.USERPROFILE || "";
   const authPath = home && resolve(home, ".codex/auth.json");
   if (authPath && existsSync(authPath)) {
     const auth = JSON.parse(readFileSync(authPath, "utf8"));
-    // Subscription (OAuth) mode stores a rotating token under tokens.access_token;
-    // API-key mode stores a static OPENAI_API_KEY. Prefer the live OAuth token,
-    // fall back to the API key so memory search keeps working in either mode.
-    const token = auth?.tokens?.access_token || auth?.OPENAI_API_KEY;
+    const oauthToken = auth?.tokens?.access_token;
+    const isSubscription = typeof oauthToken === "string" && oauthToken.length > 0;
+    // Prefer the live OAuth token (subscription); fall back to the static API key.
+    const token = isSubscription ? oauthToken : auth?.OPENAI_API_KEY;
     if (typeof token === "string" && token.length > 0) {
+      // Embeddings: api.openai.com works for a sub token AND an API key.
       process.env.QMD_EMBED_API_URL = process.env.QMD_EMBED_API_URL || "https://api.openai.com/v1";
       process.env.QMD_EMBED_API_MODEL = process.env.QMD_EMBED_API_MODEL || "text-embedding-3-large";
-      process.env.QMD_EMBED_API_KEY = token; // always use the live token
+      process.env.QMD_EMBED_API_KEY = token; // always use the live credential
 
-      process.env.QMD_EXPAND_API_URL = process.env.QMD_EXPAND_API_URL || "https://chatgpt.com/backend-api/codex";
-      process.env.QMD_EXPAND_API_MODEL = process.env.QMD_EXPAND_API_MODEL || "gpt-5.4-mini";
-      process.env.QMD_EXPAND_API_FORMAT = process.env.QMD_EXPAND_API_FORMAT || "codex-responses";
+      // LLM ops: pick the base URL by auth mode; QMD infers the format from it.
+      // Codex Responses for the subscription, Chat Completions for the API key.
+      const llmApiUrl = isSubscription
+        ? "https://chatgpt.com/backend-api/codex"
+        : "https://api.openai.com/v1";
+      const llmApiModel = "gpt-5.4-mini";
+
+      // Query expansion / HyDE works in BOTH modes: codex-responses on the sub,
+      // Chat Completions (/chat/completions) on the API key.
+      process.env.QMD_EXPAND_API_URL = process.env.QMD_EXPAND_API_URL || llmApiUrl;
+      process.env.QMD_EXPAND_API_MODEL = process.env.QMD_EXPAND_API_MODEL || llmApiModel;
       process.env.QMD_EXPAND_API_KEY = token;
 
-      process.env.QMD_RERANK_API_URL = process.env.QMD_RERANK_API_URL || "https://chatgpt.com/backend-api/codex";
-      process.env.QMD_RERANK_API_MODEL = process.env.QMD_RERANK_API_MODEL || "gpt-5.4-mini";
-      process.env.QMD_RERANK_API_FORMAT = process.env.QMD_RERANK_API_FORMAT || "codex-responses";
-      process.env.QMD_RERANK_API_KEY = token;
+      if (isSubscription) {
+        // Rerank is only reachable via Codex Responses. The plain OpenAI API has no
+        // /rerank route (that's a Cohere/Jina-style endpoint), so we configure rerank
+        // ONLY on the subscription. In API-key mode we deliberately leave the rerank
+        // env unset -> QMD's supportsRerank=false -> silent identity rerank (candidate
+        // order preserved), i.e. no 404s and no error spam. Flip back to a sub and the
+        // next spawn re-enables real reranking automatically.
+        process.env.QMD_RERANK_API_URL = process.env.QMD_RERANK_API_URL || llmApiUrl;
+        process.env.QMD_RERANK_API_MODEL = process.env.QMD_RERANK_API_MODEL || llmApiModel;
+        process.env.QMD_RERANK_API_KEY = token;
 
-      // ChatGPT Codex Responses accepts slash-mode directives in the user input.
-      // This applies only to non-vector LLM calls (query expansion/HyDE and
-      // rerank); embeddings use the OpenAI embeddings endpoint above. Set
-      // QMD_CODEX_RESPONSES_MODE=off to keep the default Codex mode.
-      process.env.QMD_CODEX_RESPONSES_MODE = process.env.QMD_CODEX_RESPONSES_MODE || "fast";
+        // Codex Responses accepts slash-mode directives (e.g. "/fast mode") in the user
+        // input; meaningful only on the codex endpoint. Set =off for default Codex mode.
+        process.env.QMD_CODEX_RESPONSES_MODE = process.env.QMD_CODEX_RESPONSES_MODE || "fast";
+      }
     }
   }
 } catch {

@@ -750,7 +750,12 @@ export class RemoteLLM implements LLM {
           top_p: 0.8,
           // Reasoning models (e.g. gpt-oss) spend tokens on hidden reasoning
           // before emitting content; 600 sometimes left content empty.
-          max_tokens: 2048,
+          // Use max_completion_tokens (not the legacy max_tokens): OpenAI's
+          // gpt-5+ models reject max_tokens outright ("Unsupported parameter:
+          // 'max_tokens' ... Use 'max_completion_tokens' instead"). It is the
+          // current OpenAI Chat Completions field and is what openai-compatible
+          // servers should accept going forward.
+          max_completion_tokens: 2048,
         });
 
     let content = "";
