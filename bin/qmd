@@ -65,7 +65,7 @@ try {
       const llmApiUrl = isSubscription
         ? "https://chatgpt.com/backend-api/codex"
         : "https://api.openai.com/v1";
-      const llmApiModel = "gpt-5.4-mini";
+      const llmApiModel = "gpt-5.6-terra";
 
       // Query expansion / HyDE works in BOTH modes: codex-responses on the sub,
       // Chat Completions (/chat/completions) on the API key.
